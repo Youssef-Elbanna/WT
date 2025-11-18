@@ -22,7 +22,17 @@
         
         // Firebase Setup
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        
+        // 🛑 التعديل هنا: يجب تهيئة firebaseConfig حتى لو كانت المتغيرات البيئية غير متوفرة (لتجنب الخطأ)
+        let firebaseConfig = {};
+        try {
+            if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                firebaseConfig = JSON.parse(__firebase_config);
+            }
+        } catch (e) {
+            console.error("Error parsing __firebase_config:", e);
+        }
+
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
         let db;
@@ -135,6 +145,8 @@
                 console.error("فشل تحميل البيانات من Google Sheet:", e);
                 dataStatusDisplay.textContent = "خطأ: فشل تحميل بيانات الطلاب من Google Sheet. تحقق من الرابط المنشور.";
                 dataStatusDisplay.className = 'text-xs text-red-700 font-medium';
+                // 🛑 هنا، على الأقل يتم إرجاع مصفوفة فارغة بدلاً من التعليق
+                STUDENTS_DATA = [];
             }
         };
 
@@ -444,6 +456,11 @@
                 // 🛑 جلب بيانات Google Sheet أولاً
                 await fetchSheetData();
 
+                // 🛑 التعديل الرئيسي: تهيئة التطبيق فقط إذا كانت إعدادات Firebase متاحة (لتجنب خطأ "projectId")
+                if (Object.keys(firebaseConfig).length === 0) {
+                     throw new Error("فشل التهيئة: إعدادات Firebase (projectId) غير متوفرة. لا يمكن الاتصال بقاعدة البيانات.");
+                }
+
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
@@ -457,8 +474,8 @@
                 } else {
                     await signInAnonymously(auth);
                 }
-
-                // 2. Set up Auth Listener
+                
+                // 2. Set up Auth Listener (listener for ongoing session management)
                 onAuthStateChanged(auth, (user) => {
                     if (user) {
                         userId = user.uid;
@@ -468,15 +485,25 @@
                         userId = crypto.randomUUID(); 
                         userIdDisplay.textContent = `حالة غير معروفة`;
                     }
-                    
-                    // Show UI after initialization
-                    document.getElementById('app-loading').classList.add('hidden');
-                    document.getElementById('app-content').classList.remove('hidden');
                 });
+                
+                // 🎯 Show UI immediately after the explicit sign-in attempt finishes
+                document.getElementById('app-loading').classList.add('hidden');
+                document.getElementById('app-content').classList.remove('hidden');
+
 
             } catch (error) {
                 console.error("Firebase Initialization Error: ", error);
-                showStatus(`خطأ في تهيئة النظام: ${error.message}`, true);
+                
+                const errorMessage = error.message.includes("projectId") 
+                    ? `خطأ فادح: فشل تهيئة النظام أو المصادقة. إعدادات Firebase (projectId) غير متوفرة. (قد يحدث هذا على منصات الاستضافة الخارجية).` 
+                    : `خطأ فادح: ${error.message}`;
+
+                showStatus(errorMessage, true);
+                
+                // 🛑 Show UI even if there is an error to display the error message
+                document.getElementById('app-loading').classList.add('hidden');
+                document.getElementById('app-content').classList.remove('hidden');
             }
         };
 

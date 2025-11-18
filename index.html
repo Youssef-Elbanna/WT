@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supervisor Bus Registration (Live Sheet Data)</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Inter Font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            direction: rtl; /* Set direction to Right-to-Left for Arabic content */
+        }
+    </style>
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, deleteDoc, onSnapshot, collection, query, where, serverTimestamp, setLogLevel, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Firebase Setup
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = 'loading'; 
+        let appInitialized = false;
+
+        // 🛑 تم تغيير الرابط: يتم جلب البيانات من الملف المنشور بالكامل (يجب أن يكون "Organized Sheet" هو الصفحة الافتراضية المنشورة)
+        const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTEWQ4H4CmAFvw0-Q6cUnmHkDucek5FP4seP4n65VP4rEsa018o8Ie8vlv41owzhEPTtd8xHKY0mASD/pub?output=csv";
+
+        // بيانات المشرفين الثابتة
+        const SUPERVISORS = [
+            { id: 'ayad_taha', name: 'أياد طه', line: 'خط البحر' },
+            { id: 'mohamed_gamal', name: 'محمد جمال', line: 'خط البحر' },
+            { id: 'yousef_elbana', name: 'يوسف البنا', line: 'خط جمال عبد الناصر' },
+            { id: 'abdelrahman_ehab', name: 'عبد الرحمن ايهاب', line: 'خط جمال عبد الناصر' },
+            { id: 'ibrahim_mohamed', name: 'ابراهيم محمد', line: 'خط العجمي' },
+            { id: 'amr', name: 'عمرو', line: 'خط السيوف' },
+            { id: 'mody', name: 'مودي', line: 'خط سموحة' },
+            { id: 'abdelrahman_walid', name: 'عبد الرحمن وليد', line: 'مسئول' },
+            { id: 'abdelrahman_lord', name: 'عبد الرحمن اللورد', line: 'مسئول' },
+        ];
+
+        let STUDENTS_DATA = []; 
+        
+        // DOM Elements
+        const supervisorSelect = document.getElementById('supervisor-select');
+        const timeSlotSelect = document.getElementById('time-slot');
+        const busIdInput = document.getElementById('bus-id');
+        const lookupResultDiv = document.getElementById('lookup-result');
+        const registerButton = document.getElementById('register-button');
+        const recordsContainer = document.getElementById('records-container');
+        const recordsSearch = document.getElementById('records-search'); 
+        const statusMessage = document.getElementById('status-message');
+        const userIdDisplay = document.getElementById('user-id-display');
+        const dataStatusDisplay = document.getElementById('data-status-display');
+        // 🎯 عنصر جديد لعرض عدد السجلات
+        const recordsCountDisplay = document.getElementById('records-count-display');
+        
+        let foundStudents = [];
+
+        // Utility function to show messages
+        const showStatus = (message, isError = false) => {
+            statusMessage.textContent = message;
+            statusMessage.className = isError 
+                ? 'text-sm text-red-600 bg-red-100 p-3 rounded-lg'
+                : 'text-sm text-green-600 bg-green-100 p-3 rounded-lg';
+            statusMessage.classList.remove('hidden');
+            setTimeout(() => { statusMessage.classList.add('hidden'); }, 5000);
+        };
+
+        // Populate Supervisor Dropdown
+        const populateSupervisors = () => {
+            supervisorSelect.innerHTML = '<option value="">-- اختر اسم المشرف --</option>';
+            SUPERVISORS.forEach(s => {
+                const option = document.createElement('option');
+                option.value = s.id;
+                option.textContent = `${s.name} مشرف ${s.line}`;
+                supervisorSelect.appendChild(option);
+            });
+        };
+        
+        // --- 🎯 دالة تحليل ملف CSV مُحسَّنة ---
+        const parseCSV = (csvText) => {
+            const lines = csvText.trim().split('\n');
+            if (lines.length <= 1) return []; 
+            
+            // نفترض الترتيب التالي بناءً على أمثلة المستخدم السابقة:
+            // Col1: TimeStamp | Col2: Bus ID | Col3: Student Name | Col4: Line/Route | Col5: Time Slot (E)
+            const data = [];
+
+            for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+
+                if (values.length >= 5) {
+                    const busId = values[1] ? values[1].toString().trim() : ''; // Bus ID (Col B/2)
+                    const name = values[2] ? values[2].trim() : ''; // Student Name (Col C/3)
+                    // تخزين الوقت كقيمة نظيفة للمقارنة لاحقًا
+                    const time = values[4] ? values[4].toString().trim() : ''; // Time Slot (Col E/5)
+                    const line = values[3] ? values[3].trim() : ''; // Line (Col D/4)
+
+                    if (busId && name && time) {
+                        data.push({
+                            busId: busId,
+                            name: name,
+                            time: time,
+                            line: line
+                        });
+                    }
+                }
+            }
+            return data; 
+        };
+
+        // --- دالة جلب بيانات Google Sheet ---
+        const fetchSheetData = async () => {
+            dataStatusDisplay.textContent = '... جاري تحميل بيانات الطلاب من Google Sheet';
+            try {
+                // استخدام `fetch` لجلب بيانات CSV المنشورة
+                const response = await fetch(SHEET_CSV_URL);
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                
+                const csvText = await response.text();
+                STUDENTS_DATA = parseCSV(csvText); 
+
+                dataStatusDisplay.textContent = `تم تحميل ${STUDENTS_DATA.length} طالب بنجاح.`;
+                dataStatusDisplay.className = 'text-xs text-green-700 font-medium';
+                
+            } catch (e) {
+                console.error("فشل تحميل البيانات من Google Sheet:", e);
+                dataStatusDisplay.textContent = "خطأ: فشل تحميل بيانات الطلاب من Google Sheet. تحقق من الرابط المنشور.";
+                dataStatusDisplay.className = 'text-xs text-red-700 font-medium';
+            }
+        };
+
+        // --- CORE APPLICATION LOGIC ---
+
+        const lookupStudents = () => {
+            const selectedSupervisorId = supervisorSelect.value;
+            const timeSlot = timeSlotSelect.value;
+            const searchId = busIdInput.value.trim().toString(); 
+            
+            if (!selectedSupervisorId) {
+                lookupResultDiv.innerHTML = '<p class="text-gray-500">الرجاء اختيار اسم المشرف أولاً.</p>';
+                registerButton.disabled = true;
+                return;
+            }
+
+            if (!timeSlot || !searchId) {
+                lookupResultDiv.innerHTML = '<p class="text-gray-500">الرجاء اختيار وقت وإدخال رقم الباص أو اسم الطالب.</p>';
+                registerButton.disabled = true;
+                return;
+            }
+            
+            if (STUDENTS_DATA.length === 0) {
+                 lookupResultDiv.innerHTML = '<p class="text-red-500">لم يتم تحميل بيانات الطلاب من Google Sheet بعد.</p>';
+                 registerButton.disabled = true;
+                 return;
+            }
+
+            // 🛑 تعديل: استخدام parseFloat للمقارنة لتوحيد تنسيق الوقت
+            const selectedTimeFloat = parseFloat(timeSlot);
+            
+            foundStudents = STUDENTS_DATA.filter(s => {
+                const sheetTimeFloat = parseFloat(s.time);
+                
+                // المقارنة الزمنية بالرقم العشري
+                const matchesTime = sheetTimeFloat === selectedTimeFloat;
+                
+                // البحث بالـ Bus ID (مطابقة تامة) أو جزء من اسم الطالب (غير حساس لحالة الأحرف)
+                const matchesId = s.busId === searchId;
+                const matchesName = s.name.toLowerCase().includes(searchId.toLowerCase());
+                
+                return matchesTime && (matchesId || matchesName);
+            });
+
+            renderLookupResults(foundStudents);
+        };
+
+        const renderLookupResults = (students) => {
+            if (students.length === 0) {
+                lookupResultDiv.innerHTML = `
+                    <p class="text-red-500 font-semibold p-2 border-2 border-red-300 rounded-lg">
+                        لا يوجد طلاب مطابقون لـ ("${busIdInput.value}") في الوقت المحدد.
+                    </p>
+                `;
+                registerButton.disabled = true;
+                return;
+            }
+
+            const studentListHtml = students.map(s => `
+                <div class="bg-gray-100 p-3 my-2 rounded-lg flex justify-between items-center border-r-4 border-indigo-500">
+                    <div>
+                        <p class="text-lg font-bold text-gray-800">${s.name}</p>
+                        <p class="text-sm text-gray-600">
+                            الخط: ${s.line} | باص: ${s.busId} | وقت: ${s.time} م
+                        </p>
+                    </div>
+                    <div class="text-xs text-indigo-700 font-medium">جاهز للتسجيل</div>
+                </div>
+            `).join('');
+
+            lookupResultDiv.innerHTML = `
+                <h3 class="text-md font-semibold mb-2">الطلاب المطابقون (${students.length}):</h3>
+                ${studentListHtml}
+            `;
+            registerButton.disabled = false;
+        };
+        
+        const registerStudent = async () => {
+            if (!db || !userId || foundStudents.length === 0 || !supervisorSelect.value) {
+                showStatus('خطأ: الرجاء اختيار المشرف وتحميل بيانات الطلاب.', true);
+                return;
+            }
+
+            const selectedSupervisor = SUPERVISORS.find(s => s.id === supervisorSelect.value);
+            const logCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/registrations`);
+            
+            // 🎯 تم جلب قيمة الوقت من القائمة المنسدلة لضمان الاتساق في السجل والفلترة
+            const selectedTimeSlotValue = timeSlotSelect.value; 
+            
+            let successCount = 0;
+            let skipCount = 0;
+
+            for (const student of foundStudents) {
+                try {
+                    // --- 🎯 منطق منع التسجيل المكرر (StudentName + TimeSlot + BusID) ---
+                    // استخدام قيمة الوقت من القائمة المنسدلة للبحث عن التكرار
+                    const q = query(
+                        logCollectionRef, 
+                        where("studentName", "==", student.name),
+                        where("timeSlot", "==", selectedTimeSlotValue),
+                        where("busId", "==", student.busId)
+                    );
+                    
+                    const existingDocs = await getDocs(q);
+
+                    if (!existingDocs.empty) {
+                        skipCount++;
+                        continue; 
+                    }
+                    // --- نهاية منع التكرار ---
+
+                    const record = {
+                        busId: student.busId,
+                        studentName: student.name,
+                        // 🛑 التعديل: تسجيل قيمة الوقت من القائمة المنسدلة لضمان تطابق الفلترة
+                        timeSlot: selectedTimeSlotValue, 
+                        
+                        // 🎯 NEW: Save the student's line/route information
+                        line: student.line, 
+                        
+                        supervisorFirebaseId: userId, 
+                        supervisorId: selectedSupervisor.id, 
+                        supervisorName: selectedSupervisor.name, 
+                        
+                        timestamp: serverTimestamp()
+                    };
+
+                    await addDoc(logCollectionRef, record);
+                    successCount++;
+
+                } catch (error) {
+                    console.error("Error writing document for student ", student.name, error);
+                    showStatus(`خطأ في تسجيل ${student.name}: ${error.message}`, true);
+                    return; 
+                }
+            }
+
+            // رسالة الحالة النهائية
+            let message = `تم تسجيل ${successCount} طالب بنجاح في الباص ${busIdInput.value} بواسطة ${selectedSupervisor.name}.`;
+            if (skipCount > 0) {
+                message += ` (${skipCount} طالب مسجل مسبقاً تم تخطيهم).`;
+            }
+            showStatus(message, successCount === 0);
+            
+            busIdInput.value = '';
+            lookupStudents(); 
+            loadRegistrations(); 
+        };
+
+        const deleteRecord = async (docId) => {
+            if (!db || !userId) {
+                showStatus('خطأ: لا يمكن الاتصال بقاعدة البيانات.', true);
+                return;
+            }
+
+            try {
+                const docRef = doc(db, `artifacts/${appId}/users/${userId}/registrations`, docId);
+                await deleteDoc(docRef);
+                showStatus('تم حذف السجل بنجاح.');
+            } catch (error) {
+                console.error("Error deleting document: ", error);
+                showStatus(`خطأ في الحذف: ${error.message}`, true);
+            }
+        };
+
+        // 🎯 NEW: Function to render the line breakdown summary
+        const renderLineSummary = (lineCounts, timeSlot) => {
+            const container = document.getElementById('records-summary-container');
+            if (!container) return;
+
+            // الحصول على النص المعروض في القائمة المنسدلة للوقت
+            const timeText = timeSlotSelect.options[timeSlotSelect.selectedIndex].textContent;
+            
+            let summaryHtml = `<h3 class="text-md font-bold text-gray-800 mb-3">ملخص خطوط الباصات لوقت ${timeText}:</h3>`;
+
+            if (Object.keys(lineCounts).length === 0) {
+                 container.innerHTML = summaryHtml + '<p class="text-sm text-gray-500 mt-2">لا توجد بيانات خطوط مسجلة حتى الآن لهذا الوقت.</p>';
+                 return;
+            }
+
+            const total = Object.values(lineCounts).reduce((sum, count) => sum + count, 0);
+
+            // فرز الخطوط تنازلياً حسب العدد
+            const sortedLines = Object.entries(lineCounts).sort(([, a], [, b]) => b - a);
+
+            summaryHtml += '<div class="space-y-3">';
+            sortedLines.forEach(([line, count]) => {
+                const percentage = total > 0 ? ((count / total) * 100).toFixed(0) : 0;
+                summaryHtml += `
+                    <div>
+                        <div class="flex justify-between items-center text-sm mb-1">
+                            <span class="font-medium text-gray-700">${line}</span>
+                            <span class="font-semibold text-indigo-600">${count} طالب (${percentage}%)</span>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-1.5">
+                            <div class="bg-indigo-500 h-1.5 rounded-full transition-all duration-500 ease-out" style="width: ${percentage}%"></div>
+                        </div>
+                    </div>
+                `;
+            });
+            summaryHtml += '</div>';
+            
+            container.innerHTML = summaryHtml;
+        };
+
+
+        const loadRegistrations = () => {
+            if (!db || !userId) {
+                recordsContainer.innerHTML = '<p class="text-gray-500">تحميل سجلات الإشراف...</p>';
+                // 🎯 عرض العداد صفر
+                recordsCountDisplay.textContent = ' (0 سجل)';
+                return;
+            }
+
+            const selectedTimeSlot = timeSlotSelect.value;
+            const searchTerm = recordsSearch.value.trim().toLowerCase();
+
+            if (!selectedTimeSlot) {
+                 recordsContainer.innerHTML = '<p class="text-gray-500 p-4 bg-white rounded-lg border">الرجاء اختيار وقت لعرض السجلات الخاصة به.</p>';
+                 // 🎯 عرض العداد صفر
+                 recordsCountDisplay.textContent = ' (0 سجل)';
+                 document.getElementById('records-summary-container').innerHTML = '<p class="text-sm text-gray-500">ملخص التسجيلات حسب الخطوط سيظهر هنا.</p>';
+                 return;
+            }
+
+            const logCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/registrations`);
+            
+            // الفلترة على Firestore باستخدام قيمة الوقت كما هي في القائمة المنسدلة
+            let q = query(
+                logCollectionRef, 
+                where("timeSlot", "==", selectedTimeSlot)
+            );
+            
+            // Listen for real-time updates
+            onSnapshot(q, (snapshot) => {
+                
+                // 🎯 فرز البيانات محليًا حسب الوقت (timestamp)
+                let sortedDocs = snapshot.docs.sort((a, b) => {
+                    const timeA = a.data().timestamp ? a.data().timestamp.toDate().getTime() : 0;
+                    const timeB = b.data().timestamp ? b.data().timestamp.toDate().getTime() : 0;
+                    // فرز تنازلي (الأحدث أولاً)
+                    return timeB - timeA; 
+                });
+
+                // Search: Local filtering by search term (name or bus ID)
+                let filteredDocs = sortedDocs;
+                if (searchTerm) {
+                    filteredDocs = sortedDocs.filter(doc => {
+                        const data = doc.data();
+                        return (data.studentName && data.studentName.toLowerCase().includes(searchTerm)) ||
+                               (data.busId && data.busId.toLowerCase().includes(searchTerm));
+                    });
+                }
+                
+                // 🎯 تحديث العداد
+                recordsCountDisplay.textContent = ` (${filteredDocs.length} سجل)`;
+                
+                // 🎯 NEW: Calculate and render line breakdown summary
+                const lineCounts = {};
+                filteredDocs.forEach(doc => {
+                    const data = doc.data();
+                    // تأكد من وجود خاصية line في بيانات السجل
+                    const line = data.line || 'خط غير مسجل (قديم)'; 
+                    lineCounts[line] = (lineCounts[line] || 0) + 1;
+                });
+                renderLineSummary(lineCounts, selectedTimeSlot);
+
+                let recordsHtml = '';
+                if (filteredDocs.length === 0) {
+                    recordsHtml = '<p class="text-gray-500 p-4 bg-white rounded-lg border">لا توجد سجلات ركوب مسجلة لهذا الوقت/البحث.</p>';
+                } else {
+                    recordsHtml = filteredDocs.map(doc => {
+                        const data = doc.data();
+                        const time = data.timestamp ? new Date(data.timestamp.toDate()).toLocaleTimeString('ar-EG', {hour: '2-digit', minute:'2-digit'}) : '...';
+                        const date = data.timestamp ? new Date(data.timestamp.toDate()).toLocaleDateString('ar-EG') : '...';
+                        
+                        return `
+                            <div class="bg-white p-4 my-2 rounded-lg shadow-sm flex justify-between items-center transition hover:shadow-md">
+                                <div>
+                                    <p class="text-md font-bold text-indigo-700">${data.studentName}</p>
+                                    <p class="text-sm text-gray-700">باص: ${data.busId} | خط: ${data.line || 'غير مسجل'} | وقت: ${data.timeSlot} م</p>
+                                    <p class="text-xs text-gray-500 mt-1">تم التسجيل بواسطة: ${data.supervisorName || 'غير معروف'} @ ${date} ${time}</p>
+                                </div>
+                                <button onclick="window.deleteRecord('${doc.id}')" class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-full text-xs transition duration-150">
+                                    حذف
+                                </button>
+                            </div>
+                        `;
+                    }).join('');
+                }
+                recordsContainer.innerHTML = recordsHtml;
+            }, (error) => {
+                console.error("Error loading records: ", error);
+                recordsContainer.innerHTML = `<p class="text-red-500">خطأ في تحميل السجلات: ${error.message}</p>`;
+                // 🎯 عرض العداد صفر في حالة الخطأ
+                recordsCountDisplay.textContent = ' (خطأ في التحميل)';
+            });
+        };
+
+
+        // --- INITIALIZATION AND BINDING ---
+
+        const initializeAppAndAuth = async () => {
+            try {
+                populateSupervisors(); 
+                
+                // 🛑 جلب بيانات Google Sheet أولاً
+                await fetchSheetData();
+
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // For debugging:
+                setLogLevel('error'); 
+
+                // 1. Authenticate the user
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // 2. Set up Auth Listener
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        userIdDisplay.textContent = `مُعرّف النظام (UID): ${userId}`;
+                        appInitialized = true;
+                    } else {
+                        userId = crypto.randomUUID(); 
+                        userIdDisplay.textContent = `حالة غير معروفة`;
+                    }
+                    
+                    // Show UI after initialization
+                    document.getElementById('app-loading').classList.add('hidden');
+                    document.getElementById('app-content').classList.remove('hidden');
+                });
+
+            } catch (error) {
+                console.error("Firebase Initialization Error: ", error);
+                showStatus(`خطأ في تهيئة النظام: ${error.message}`, true);
+            }
+        };
+
+        // Bind functions to window scope for use in inline HTML 
+        window.deleteRecord = deleteRecord;
+        
+        // Setup event listeners
+        supervisorSelect.addEventListener('change', lookupStudents); 
+        timeSlotSelect.addEventListener('change', () => { 
+            lookupStudents(); 
+            loadRegistrations(); 
+        });
+        busIdInput.addEventListener('input', lookupStudents);
+        registerButton.addEventListener('click', registerStudent);
+        recordsSearch.addEventListener('input', loadRegistrations); 
+        
+        // Start the application
+        initializeAppAndAuth();
+    </script>
+</head>
+<body class="bg-gray-50 p-4 sm:p-8 min-h-screen">
+    
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-extrabold text-indigo-800 mb-6 border-b pb-2">نظام تسجيل ركوب الباصات</h1>
+
+        <div id="app-loading" class="text-center p-10 bg-white rounded-xl shadow-lg">
+            <p class="text-indigo-500 font-semibold text-lg">... يتم تحميل النظام والمصادقة الأمنية</p>
+        </div>
+
+        <div id="app-content" class="grid grid-cols-1 lg:grid-cols-3 gap-8 hidden">
+            
+            <!-- Column 1 & 2: Registration Panel -->
+            <div class="lg:col-span-2 bg-white p-6 rounded-xl shadow-xl space-y-6">
+                
+                <h2 class="text-xl font-bold text-gray-700 border-b pb-3 mb-4">1. تسجيل ركوب الطلاب</h2>
+
+                <!-- Supervisor Input -->
+                <div class="mb-4">
+                    <label for="supervisor-select" class="block text-sm font-medium text-gray-700 mb-1">اختيار المشرف المسؤول</label>
+                    <select id="supervisor-select" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+                        <!-- Options populated by JavaScript -->
+                    </select>
+                </div>
+
+                <!-- Time & Bus ID Fields -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label for="time-slot" class="block text-sm font-medium text-gray-700 mb-1">وقت الرحلة</label>
+                        <select id="time-slot" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+                            <option value="">-- اختر وقتاً --</option>
+                            <option value="12.3">12:30 م</option>
+                            <option value="1.3">01:30 م</option>
+                            <option value="4.0">04:00 م</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="bus-id" class="block text-sm font-medium text-gray-700 mb-1">رقم الباص أو اسم الطالب</label>
+                        <input type="text" id="bus-id" placeholder="أدخل رقم الباص أو جزء من الاسم..." class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-left" dir="ltr" />
+                    </div>
+                </div>
+                <p id="data-status-display" class="text-xs text-gray-500"></p>
+
+                <div id="status-message" class="hidden my-4"></div>
+
+                <!-- Lookup Results -->
+                <div id="lookup-result" class="min-h-[100px] p-4 bg-gray-50 rounded-lg border border-gray-200">
+                    <p class="text-gray-500">الرجاء إدخال بيانات الباص والوقت.</p>
+                </div>
+
+                <!-- Register Button -->
+                <button id="register-button" disabled class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-xl shadow-lg transition duration-300 transform hover:scale-[1.01] disabled:bg-indigo-400">
+                    تسجيل جميع الطلاب الظاهرين في الباص (ركب الباص)
+                </button>
+
+            </div>
+
+            <!-- Column 3: Supervisor Records -->
+            <div class="lg:col-span-1 bg-gray-100 p-6 rounded-xl shadow-inner space-y-4">
+                
+                <!-- 🎯 تم دمج العداد في العنوان -->
+                <h2 class="text-xl font-bold text-gray-700 border-b pb-3 flex justify-between items-center">
+                    <span>2. سجلاتي اليومية</span>
+                    <span id="records-count-display" class="text-sm font-semibold text-indigo-500"> (0 سجل)</span>
+                </h2>
+                
+                <p id="user-id-display" class="text-xs text-gray-600 mb-4 bg-white p-2 rounded-lg"></p>
+
+                <!-- 🎯 NEW: Summary Container -->
+                <div id="records-summary-container" class="space-y-2 mb-6 p-4 bg-white rounded-xl shadow-md border-b-4 border-indigo-400">
+                    <p class="text-sm text-gray-500">ملخص التسجيلات حسب الخطوط سيظهر هنا.</p>
+                </div>
+
+                <!-- Search Input -->
+                <div class="mb-4">
+                    <input type="text" id="records-search" placeholder="ابحث بالاسم أو رقم الباص..." class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150" />
+                </div>
+
+                <!-- Records List -->
+                <div id="records-container" class="space-y-3">
+                    <p class="text-gray-500">... الرجاء اختيار وقت لعرض السجلات</p>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</body>
+</html>
